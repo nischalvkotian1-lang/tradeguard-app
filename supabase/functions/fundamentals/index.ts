@@ -8,6 +8,9 @@ const corsHeaders = {
 
 interface FundamentalData {
   symbol: string;
+  companyName: string | null;
+  currentPrice: number | null;
+  currency: string;
   marketCap: number | null;
   netIncome: number | null;
   totalDebt: number | null;
@@ -15,6 +18,7 @@ interface FundamentalData {
   debtToEquity: number | null;
   institutionalOwnershipPct: number | null;
   source: string;
+  timestamp: string;
   notFound?: boolean;
 }
 
@@ -116,7 +120,6 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Always append .NS for NSE; fall back to .BO for BSE if NSE fails
     const candidates: string[] = [];
     if (symbol.includes(".")) {
       candidates.push(symbol);
@@ -126,33 +129,42 @@ Deno.serve(async (req: Request) => {
 
     let summary: any = null;
     let chart: any = null;
+    let resolvedTicker = symbol;
+
     for (const sym of candidates) {
       [summary, chart] = await Promise.all([
         fetchQuoteSummary(sym),
         fetchChartMeta(sym),
       ]);
-      if (summary || chart) break;
+      if (summary || chart) {
+        resolvedTicker = sym;
+        break;
+      }
     }
 
     if (!summary && !chart) {
       return new Response(
-        JSON.stringify({ symbol, notFound: true, source: "Unknown" }),
+        JSON.stringify({ symbol, notFound: true, source: "Yahoo Finance (NSE/BSE)", timestamp: new Date().toISOString() }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
-    const price = summary?.price ?? chart?.meta ?? {};
+    const priceObj = summary?.price ?? {};
+    const chartMeta = chart?.meta ?? {};
     const financialData = summary?.financialData ?? {};
     const keyStats = summary?.defaultKeyStatistics ?? {};
 
-    let marketCap = num(financialData.marketCap) ?? num(price.marketCap) ?? num(keyStats.enterpriseValue);
-    if (marketCap == null && chart?.meta) {
-      const mp = num(chart.meta.regularMarketPrice);
-      const sh = num(chart.meta.sharesOutstanding);
-      if (mp != null && sh != null) marketCap = mp * sh;
+    // Extract current price and company name
+    const currentPrice = num(priceObj?.regularMarketPrice) ?? num(chartMeta?.regularMarketPrice);
+    const companyName = priceObj?.shortName ?? priceObj?.longName ?? chartMeta?.symbol ?? symbol;
+    const currency = priceObj?.currency ?? chartMeta?.currency ?? "INR";
+
+    let marketCap = num(financialData.marketCap) ?? num(priceObj.marketCap) ?? num(keyStats.enterpriseValue);
+    if (marketCap == null && currentPrice != null) {
+      const sh = num(chartMeta.sharesOutstanding) ?? num(priceObj.sharesOutstanding);
+      if (sh != null) marketCap = currentPrice * sh;
     }
 
-    // Profitability: prefer netIncomeToCommon, fall back to operatingMargins
     let netIncome = num(financialData.netIncomeToCommon);
     if (netIncome == null) {
       const opMargin = num(financialData.operatingMargins);
@@ -177,7 +189,7 @@ Deno.serve(async (req: Request) => {
     if (Array.isArray(instHoldings) && instHoldings.length > 0) {
       const latest = instHoldings[instHoldings.length - 1];
       const reported = num(latest?.reportDate);
-      const sharesOut = num(price?.sharesOutstanding) ?? num(keyStats?.sharesOutstanding);
+      const sharesOut = num(priceObj?.sharesOutstanding) ?? num(keyStats?.sharesOutstanding);
       if (reported != null && sharesOut != null && sharesOut > 0) {
         institutionalOwnershipPct = (reported / sharesOut) * 100;
       }
@@ -188,7 +200,10 @@ Deno.serve(async (req: Request) => {
     }
 
     const data: FundamentalData = {
-      symbol,
+      symbol: resolvedTicker,
+      companyName,
+      currentPrice,
+      currency,
       marketCap,
       netIncome,
       totalDebt,
@@ -196,6 +211,7 @@ Deno.serve(async (req: Request) => {
       debtToEquity,
       institutionalOwnershipPct,
       source: "Yahoo Finance (NSE/BSE)",
+      timestamp: new Date().toISOString(),
     };
 
     return new Response(JSON.stringify(data), {
