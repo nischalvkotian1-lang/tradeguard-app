@@ -85,6 +85,8 @@ interface FundamentalsHealth {
 
 interface FundamentalData {
   symbol: string;
+  currentPrice: number | null;
+  companyName: string | null;
   marketCap: number | null;
   netIncome: number | null;
   totalDebt: number | null;
@@ -92,11 +94,25 @@ interface FundamentalData {
   debtToEquity: number | null;
   institutionalOwnershipPct: number | null;
   source: string;
+  timestamp: string;
   notFound?: boolean;
 }
 
+type PriceFetchState = 'idle' | 'loading' | 'success' | 'error';
+
+type RiskTolerance = 'low' | 'medium' | 'high';
+
+const RISK_TOLERANCE_MAP: Record<RiskTolerance, PresetName> = {
+  low: 'conservative',
+  medium: 'moderate',
+  high: 'aggressive',
+};
+
+const BUDGET_PRESETS = [5000, 10000, 25000, 50000];
+
 // Built-in fallback dataset: top 30 NSE stocks. Values in rupees (1 Crore = 1e7).
-const CACHED_FALLBACK: Record<string, Omit<FundamentalData, 'symbol' | 'notFound'>> = {
+type CachedFundamental = Omit<FundamentalData, 'symbol' | 'notFound' | 'currentPrice' | 'companyName' | 'timestamp'>;
+const CACHED_FALLBACK: Record<string, CachedFundamental> = {
   RELIANCE: { marketCap: 2400000000000, netIncome: 90000000000, totalDebt: 300000000000, totalEquity: 600000000000, debtToEquity: 0.50, institutionalOwnershipPct: 50, source: 'Verified Cached Data' },
   TCS: { marketCap: 1700000000000, netIncome: 50000000000, totalDebt: 10000000000, totalEquity: 500000000000, debtToEquity: 0.02, institutionalOwnershipPct: 55, source: 'Verified Cached Data' },
   HDFCBANK: { marketCap: 1500000000000, netIncome: 70000000000, totalDebt: 200000000000, totalEquity: 2000000000000, debtToEquity: 0.10, institutionalOwnershipPct: 55, source: 'Verified Cached Data' },
@@ -131,7 +147,7 @@ const CACHED_FALLBACK: Record<string, Omit<FundamentalData, 'symbol' | 'notFound
 
 
 
-function scoreFundamentals(data: FundamentalData): FundamentalsHealth {
+function scoreFundamentals(data: Pick<FundamentalData, 'marketCap' | 'netIncome' | 'debtToEquity' | 'institutionalOwnershipPct'>): FundamentalsHealth {
   const checks: HealthCheck[] = [];
 
   // Market Cap thresholds in rupees: Large Cap > ₹80,000 Cr (8e11), Mid Cap ₹20,000-80,000 Cr (2e11-8e11)
@@ -186,15 +202,31 @@ function scoreFundamentals(data: FundamentalData): FundamentalsHealth {
 
 export default function App() {
   const [symbol, setSymbol] = useState('');
-  const [priceRaw, setPriceRaw] = useState('');
   const [capitalRaw, setCapitalRaw] = useState('100000');
   const [riskPctRaw, setRiskPctRaw] = useState('2');
   const currency: Currency = 'INR';
   const [preset, setPreset] = useState<PresetName>('moderate');
   const [customSlRaw, setCustomSlRaw] = useState('5');
   const [customRrRaw, setCustomRrRaw] = useState('2');
+  const [riskTolerance, setRiskTolerance] = useState<RiskTolerance>('medium');
 
-  const price = parseInput(priceRaw);
+  const handleRiskTolerance = (rt: RiskTolerance) => {
+    setRiskTolerance(rt);
+    const mapped = RISK_TOLERANCE_MAP[rt];
+    setPreset(mapped);
+    setCustomSlRaw(String(PRESETS[mapped].stopLossPct));
+    setCustomRrRaw(String(PRESETS[mapped].rrRatio));
+  };
+
+  // Live price state
+  const [livePrice, setLivePrice] = useState<number | null>(null);
+  const [liveCompany, setLiveCompany] = useState<string | null>(null);
+  const [priceFetchState, setPriceFetchState] = useState<PriceFetchState>('idle');
+  const [priceSource, setPriceSource] = useState<string | null>(null);
+  const [priceTimestamp, setPriceTimestamp] = useState<string | null>(null);
+  const [priceError, setPriceError] = useState<string | null>(null);
+
+  const price = livePrice ?? 0;
   const capital = parseInput(capitalRaw);
   const riskPct = clamp(parseInput(riskPctRaw), 0, 100);
 
@@ -208,6 +240,83 @@ export default function App() {
   const [health, setHealth] = useState<FundamentalsHealth | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [healthSource, setHealthSource] = useState<string | null>(null);
+
+  // Live price fetch — fires when symbol changes
+  useEffect(() => {
+    if (!sym) {
+      setLivePrice(null);
+      setLiveCompany(null);
+      setPriceFetchState('idle');
+      setPriceSource(null);
+      setPriceTimestamp(null);
+      setPriceError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setPriceFetchState('loading');
+      setPriceError(null);
+
+      const base = sym.replace(/\.(NS|BO|BSE)$/, '');
+      const cached = CACHED_FALLBACK[base];
+
+      const timeoutId = setTimeout(() => {
+        if (cached) {
+          setLivePrice(null);
+        }
+      }, 2500);
+
+      try {
+        const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/fundamentals`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          },
+          body: JSON.stringify({ symbol: sym }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: FundamentalData = await res.json();
+        if ((data as any).error) throw new Error((data as any).error);
+
+        if (data.notFound) {
+          setPriceFetchState('error');
+          setPriceError('Symbol not found on NSE/BSE');
+          setLivePrice(null);
+          setLiveCompany(null);
+          return;
+        }
+
+        if (data.currentPrice != null && data.currentPrice > 0) {
+          setLivePrice(data.currentPrice);
+          setLiveCompany(data.companyName || sym);
+          setPriceSource(data.source || 'Live NSE Feed');
+          setPriceTimestamp(data.timestamp || new Date().toISOString());
+          setPriceFetchState('success');
+        } else {
+          setPriceFetchState('error');
+          setPriceError('No live price available for this symbol');
+          setLivePrice(null);
+          setLiveCompany(null);
+        }
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setPriceFetchState('error');
+        setPriceError(err instanceof Error ? err.message : 'Failed to fetch price');
+        setLivePrice(null);
+        setLiveCompany(null);
+      }
+    }, 500);
+
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [sym]);
 
   useEffect(() => {
     if (!sym || price <= 0) {
@@ -371,9 +480,13 @@ export default function App() {
             <SearchCard
               symbol={symbol}
               setSymbol={setSymbol}
-              priceRaw={priceRaw}
-              setPriceRaw={setPriceRaw}
               currency={currency}
+              priceFetchState={priceFetchState}
+              livePrice={livePrice}
+              liveCompany={liveCompany}
+              priceSource={priceSource}
+              priceTimestamp={priceTimestamp}
+              priceError={priceError}
             />
             <FundamentalSafetyCard
               health={health}
@@ -399,6 +512,8 @@ export default function App() {
               riskCap={riskCap}
               isHighRisk={isHighRisk}
               effectiveRiskPct={effectiveRiskPct}
+              riskTolerance={riskTolerance}
+              onRiskToleranceChange={handleRiskTolerance}
             />
           </div>
 
@@ -494,19 +609,30 @@ function CardLabel({ icon: Icon, title, subtitle }: { icon: React.ElementType; t
 function SearchCard({
   symbol,
   setSymbol,
-  priceRaw,
-  setPriceRaw,
   currency,
+  priceFetchState,
+  livePrice,
+  liveCompany,
+  priceSource,
+  priceTimestamp,
+  priceError,
 }: {
   symbol: string;
   setSymbol: (v: string) => void;
-  priceRaw: string;
-  setPriceRaw: (v: string) => void;
   currency: Currency;
+  priceFetchState: PriceFetchState;
+  livePrice: number | null;
+  liveCompany: string | null;
+  priceSource: string | null;
+  priceTimestamp: string | null;
+  priceError: string | null;
 }) {
+  const isLive = priceFetchState === 'success' && priceSource && !priceSource.includes('Cached');
+  const isCached = priceFetchState === 'success' && priceSource && priceSource.includes('Cached');
+
   return (
     <Card>
-      <CardLabel icon={Search} title="Stock Setup" subtitle="Enter NSE/BSE symbol and current market price" />
+      <CardLabel icon={Search} title="Stock Setup" subtitle="Enter NSE/BSE symbol to fetch live market data" />
       <div className="space-y-4">
         <div>
           <label className="mb-1.5 block text-xs font-medium text-slate-400">NSE / BSE Stock Symbol</label>
@@ -520,21 +646,67 @@ function SearchCard({
             />
           </div>
         </div>
-        <div>
-          <label className="mb-1.5 block text-xs font-medium text-slate-400">Current Price ({CURRENCY_META[currency].symbol})</label>
-          <div className="relative">
-            <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 font-mono text-sm font-semibold text-slate-500">
-              {CURRENCY_META[currency].symbol}
-            </span>
-            <input
-              value={priceRaw}
-              onChange={(e) => setPriceRaw(e.target.value)}
-              inputMode="decimal"
-              placeholder="0.00"
-              className="w-full rounded-lg border border-white/10 bg-navy-850 py-2.5 pl-8 pr-4 font-mono text-sm font-semibold text-white placeholder:text-slate-600 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
-            />
+
+        {priceFetchState === 'loading' && (
+          <div className="flex items-center gap-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-4">
+            <Loader2 className="h-5 w-5 animate-spin text-cyan-400" />
+            <div>
+              <p className="text-sm font-medium text-cyan-200">Fetching live NSE price...</p>
+              <p className="text-[11px] text-slate-500">Querying Yahoo Finance for {symbol.trim().toUpperCase() || '...'}</p>
+            </div>
           </div>
-        </div>
+        )}
+
+        {priceFetchState === 'success' && livePrice != null && (
+          <div className="rounded-lg border border-white/10 bg-navy-850 p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-bold text-white">{liveCompany || symbol.trim().toUpperCase()}</p>
+                <p className="font-mono text-[10px] text-slate-500">{symbol.trim().toUpperCase()}.NS</p>
+              </div>
+              <span
+                className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold ${
+                  isLive
+                    ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30'
+                    : 'bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30'
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${isLive ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+                {isLive ? 'Live NSE Feed' : 'Verified Cached Data'}
+              </span>
+            </div>
+            <div className="flex items-baseline gap-2">
+              <span className="font-mono text-2xl font-bold text-cyan-300 text-glow-cyan">
+                {formatMoney(livePrice, currency)}
+              </span>
+              <span className="text-[11px] text-slate-500">per share</span>
+            </div>
+            {priceTimestamp && (
+              <p className="mt-2 text-[10px] text-slate-600">
+                Updated: {new Date(priceTimestamp).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}
+              </p>
+            )}
+          </div>
+        )}
+
+        {priceFetchState === 'error' && (
+          <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <div>
+              <p className="text-sm font-semibold text-amber-200">Could not fetch live price</p>
+              <p className="text-[11px] leading-relaxed text-amber-200/70">
+                {priceError || 'Unknown error'}. Check the symbol and try again.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {priceFetchState === 'idle' && (
+          <div className="flex items-center gap-3 rounded-lg border border-white/5 bg-navy-850/50 p-4">
+            <TrendingUp className="h-4 w-4 text-slate-600" />
+            <p className="text-xs text-slate-500">Enter a stock symbol above to auto-fetch the live market price</p>
+          </div>
+        )}
       </div>
     </Card>
   );
@@ -557,6 +729,8 @@ function RiskSettingsCard({
   riskCap,
   isHighRisk,
   effectiveRiskPct,
+  riskTolerance,
+  onRiskToleranceChange,
 }: {
   capitalRaw: string;
   setCapitalRaw: (v: string) => void;
@@ -574,13 +748,23 @@ function RiskSettingsCard({
   riskCap: number;
   isHighRisk: boolean;
   effectiveRiskPct: number;
+  riskTolerance: RiskTolerance;
+  onRiskToleranceChange: (rt: RiskTolerance) => void;
 }) {
+  const currentBudget = parseInput(capitalRaw);
+
+  const toleranceOptions: { key: RiskTolerance; label: string; desc: string }[] = [
+    { key: 'low', label: 'Low', desc: 'Capital preservation' },
+    { key: 'medium', label: 'Medium', desc: 'Balanced' },
+    { key: 'high', label: 'High', desc: 'Aggressive / wider stops' },
+  ];
+
   return (
     <Card>
-      <CardLabel icon={Lock} title="Risk Settings" subtitle="Define your capital and max risk per trade" />
+      <CardLabel icon={Lock} title="Risk Settings" subtitle="Define your budget and risk tolerance" />
       <div className="space-y-5">
         <div>
-          <label className="mb-1.5 block text-xs font-medium text-slate-400">Account Capital</label>
+          <label className="mb-1.5 block text-xs font-medium text-slate-400">Total Budget ({CURRENCY_META[currency].symbol})</label>
           <div className="relative">
             <Wallet className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
             <span className="pointer-events-none absolute left-9 top-1/2 -translate-y-1/2 font-mono text-sm font-semibold text-slate-500">
@@ -593,7 +777,51 @@ function RiskSettingsCard({
               className="w-full rounded-lg border border-white/10 bg-navy-850 py-2.5 pl-12 pr-4 font-mono text-sm font-semibold text-white focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
             />
           </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {BUDGET_PRESETS.map((amt) => {
+              const active = currentBudget === amt;
+              return (
+                <button
+                  key={amt}
+                  onClick={() => setCapitalRaw(String(amt))}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition ${
+                    active
+                      ? 'border-cyan-400/60 bg-cyan-400/10 text-cyan-200 glow-cyan'
+                      : 'border-white/10 bg-navy-850 text-slate-400 hover:border-white/20 hover:bg-navy-800 hover:text-slate-200'
+                  }`}
+                >
+                  {CURRENCY_META[currency].symbol}{formatNumber(amt)}
+                </button>
+              );
+            })}
+          </div>
         </div>
+
+        <div>
+          <label className="mb-2 block text-xs font-medium text-slate-400">Risk Tolerance</label>
+          <div className="grid grid-cols-3 gap-2">
+            {toleranceOptions.map((opt) => {
+              const active = riskTolerance === opt.key;
+              return (
+                <button
+                  key={opt.key}
+                  onClick={() => onRiskToleranceChange(opt.key)}
+                  className={`rounded-lg border p-2.5 text-center transition ${
+                    active
+                      ? 'border-cyan-400/60 bg-cyan-400/10 glow-cyan'
+                      : 'border-white/10 bg-navy-850 hover:border-white/20 hover:bg-navy-800'
+                  }`}
+                >
+                  <span className={`block text-xs font-bold ${active ? 'text-cyan-200' : 'text-slate-300'}`}>
+                    {opt.label}
+                  </span>
+                  <span className="mt-0.5 block text-[9px] leading-tight text-slate-500">{opt.desc}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
         <div>
           <div className="mb-1.5 flex items-center justify-between">
             <label className="text-xs font-medium text-slate-400">Max Risk % per Trade</label>
